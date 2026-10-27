@@ -12,7 +12,7 @@ class CompileError(Exception):
     pass
 
 
-PREAMBLE = """#set page(width: auto, height: auto, margin: 2pt, fill: white)
+PREAMBLE = """#set page(width: auto, height: auto, margin: 2pt, fill: none)
 #set text(size: 18pt, fill: black)
 """
 

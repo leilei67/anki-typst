@@ -2,6 +2,9 @@
 import importlib.util
 import json
 import tempfile
+import threading
+import shutil
+import sys
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -24,10 +27,13 @@ class AnkiIntegrationTests(unittest.TestCase):
         self.callbacks = []
         self.editor = object.__new__(NewEditor)
         self.editor.web = SimpleNamespace(eval=self.callbacks.append)
+        self.destroyed = []
+        self.editor.widget = SimpleNamespace(destroyed=SimpleNamespace(connect=self.destroyed.append))
+        self.delivered = threading.Event()
         self.mw = SimpleNamespace(
             col=self.collection,
             addonManager=SimpleNamespace(getConfig=lambda _: {}),
-            taskman=SimpleNamespace(run_in_background=self.enqueue),
+            taskman=SimpleNamespace(run_in_background=self.enqueue, run_on_main=self.on_main),
         )
         self.patch = patch.object(aqt, 'mw', self.mw)
         self.patch.start()
@@ -39,12 +45,18 @@ class AnkiIntegrationTests(unittest.TestCase):
         self.handler = self.added_hooks[-1][0]
 
     def tearDown(self):
+        for callback in self.destroyed:
+            callback()
         for hook, functions in zip(self.hooks, self.added_hooks):
             for function in functions:
                 hook.remove(function)
         self.patch.stop()
         self.collection.close()
         self.tmp.cleanup()
+
+    def on_main(self, update):
+        update()
+        self.delivered.set()
 
     def enqueue(self, task, done, uses_collection):
         self.assertFalse(uses_collection, 'compilation must not lock the collection')
@@ -104,3 +116,23 @@ class AnkiIntegrationTests(unittest.TestCase):
         self.assertEqual(self.handler(handled, 'unrelated', self.editor), handled)
         self.assertEqual(self.handler((False, None), 'inline-typst:bad json', self.editor), (True, None))
         self.assertEqual(self.jobs, [])
+
+    @unittest.skipUnless(shutil.which('nvim'), 'Neovim required')
+    def test_vim_bridge_temporarily_suspends_ankivim_and_restores_it(self):
+        removed, restored = [], []
+        interceptor = object()
+        target = SimpleNamespace(removeEventFilter=removed.append, installEventFilter=restored.append)
+        self.editor.web.focusProxy = lambda: target
+        self.editor.parentWindow = None
+        addon = SimpleNamespace(active_vim_instances={id(self.editor): (object(), interceptor)})
+        with patch.dict(sys.modules, {'978943807': addon}):
+            payload = {'action': 'start', 'session': 1, 'source': '$x$', 'cursor': [1, 2]}
+            result = self.handler((False, None), 'inline-typst-vim:' + json.dumps(payload), self.editor)
+            self.assertEqual(result, (True, None))
+            self.assertEqual(removed, [interceptor])
+            self.assertTrue(self.delivered.wait(5), 'Neovim should send a source snapshot')
+            self.assertIn('vimReceive(1,', self.callbacks[-1])
+            self.assertIn('"source": "$x$"', self.callbacks[-1])
+            stop = {'action': 'stop', 'session': 1}
+            self.handler((False, None), 'inline-typst-vim:' + json.dumps(stop), self.editor)
+            self.assertEqual(restored, [interceptor])

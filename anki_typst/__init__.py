@@ -3,6 +3,7 @@
 
 def register():
     import json
+    import sys
     import weakref
     from pathlib import Path
 
@@ -11,11 +12,94 @@ def register():
 
     from .compiler import snippet_name
     from .live import compile_preview, parse_request
+    from .vim import VimBridge
 
     javascript = Path(__file__).with_name("editor.js").read_text(encoding="utf-8")
+    vim_bridges = weakref.WeakKeyDictionary()
+    vim_restores = weakref.WeakKeyDictionary()
 
     def initialize(editor):
-        editor.web.eval(javascript)
+        config = mw.addonManager.getConfig(__name__) or {}
+        editor.web.eval(
+            "window.inlineTypstConfig = " + json.dumps({"vimEnabled": config.get("vim_enabled", True)})
+            + ";" + javascript
+        )
+
+    def suspend_ankivim(editor):
+        # AnkiVim's Qt filter otherwise consumes keys before the popup receives them.
+        addon = sys.modules.get("978943807")
+        pair = getattr(addon, "active_vim_instances", {}).get(id(editor))
+        if not pair:
+            return lambda: None
+        _, interceptor = pair
+        targets = [editor.web.focusProxy() or editor.web, editor.parentWindow]
+        for target in targets:
+            if target is not None:
+                target.removeEventFilter(interceptor)
+
+        def restore():
+            for target in targets:
+                if target is not None:
+                    try:
+                        target.installEventFilter(interceptor)
+                    except RuntimeError:
+                        pass
+        return restore
+
+    def vim_message(text, context):
+        try:
+            request = json.loads(text[len("inline-typst-vim:"):])
+            if not isinstance(request, dict) or request.get("action") not in ("start", "keys", "stop"):
+                raise ValueError()
+            if type(request.get("session")) is not int or request["session"] <= 0:
+                raise ValueError()
+            if request["action"] == "start":
+                if not isinstance(request.get("source"), str) or len(request["source"]) > 50000:
+                    raise ValueError()
+            if "keys" in request and (not isinstance(request["keys"], str) or len(request["keys"]) > 10000):
+                raise ValueError()
+            if "paste" in request and (not isinstance(request["paste"], str) or len(request["paste"]) > 50000):
+                raise ValueError()
+            if "cursor" in request:
+                cursor = request["cursor"]
+                if not isinstance(cursor, list) or len(cursor) != 2 or any(type(n) is not int for n in cursor):
+                    raise ValueError()
+                if cursor[0] < 1 or cursor[1] < 0:
+                    raise ValueError()
+            if request["action"] == "start" and "cursor" not in request:
+                raise ValueError()
+        except (ValueError, TypeError):
+            return (True, None)
+        config = mw.addonManager.getConfig(__name__) or {}
+        if not config.get("vim_enabled", True):
+            return (True, None)
+        if context not in vim_bridges:
+            bridge = VimBridge()
+            vim_bridges[context] = bridge
+            if getattr(context, "widget", None) is not None:
+                context.widget.destroyed.connect(lambda *_: bridge.close())
+        editor_ref = weakref.ref(context)
+
+        def deliver(session, result):
+            def update():
+                editor = editor_ref()
+                if editor is None or editor.web is None:
+                    return
+                try:
+                    editor.web.eval(
+                        f"window.inlineTypst?.vimReceive({session}, {json.dumps(result)});"
+                    )
+                except RuntimeError:
+                    pass
+            mw.taskman.run_on_main(update)
+
+        if request["action"] == "start":
+            vim_restores.pop(context, lambda: None)()
+            vim_restores[context] = suspend_ankivim(context)
+        elif request["action"] == "stop":
+            vim_restores.pop(context, lambda: None)()
+        vim_bridges[context].dispatch(request, config, deliver)
+        return (True, None)
 
     def buttons(buttons, editor):
         buttons.append(editor.addButton(
@@ -29,7 +113,11 @@ def register():
         ))
 
     def message(handled, text, context):
-        if not text.startswith("inline-typst:") or not isinstance(context, (Editor, NewEditor)):
+        if not isinstance(context, (Editor, NewEditor)):
+            return handled
+        if text.startswith("inline-typst-vim:"):
+            return vim_message(text, context)
+        if not text.startswith("inline-typst:"):
             return handled
         try:
             request = parse_request(text[len("inline-typst:"):])

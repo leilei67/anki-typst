@@ -5,13 +5,16 @@ const { test } = require('node:test');
 const { parseHTML } = require('linkedom');
 const code = fs.readFileSync('anki_typst/editor.js', 'utf8');
 
-function fixture(html) {
+function fixture(html, options = {}) {
     delete global.inlineTypst;
+    delete global.inlineTypstConfig;
     const { window, document } = parseHTML('<html><body><div id="editor"></div></body></html>');
+    window.inlineTypstConfig = options;
     const shadow = document.querySelector('#editor').attachShadow({ mode: 'open' });
     shadow.innerHTML = `<anki-editable contenteditable="true">${html}</anki-editable>`;
     const field = shadow.querySelector('anki-editable');
     const requests = [];
+    const vimRequests = [];
     const acknowledgements = new Map();
     let guarded = false;
     const timers = new Map();
@@ -23,6 +26,7 @@ function fixture(html) {
         window, document, HTMLElement: window.HTMLElement, customElements: window.customElements,
         MutationObserver: window.MutationObserver, Event: window.Event, Node: window.Node,
         InputEvent: window.Event,
+        TextEncoder,
         NodeFilter: { SHOW_TEXT: 4 }, innerWidth: 1024, innerHeight: 768,
         require(name) {
             assert.equal(name, 'anki/RichTextInput');
@@ -34,9 +38,13 @@ function fixture(html) {
                 lifecycle: { onMount() {} },
             };
         },
-        setTimeout(fn) { const id = ++nextTimer; timers.set(id, fn); return id; },
+        setTimeout(fn, delay) { const id = ++nextTimer; timers.set(id, { fn, delay }); return id; },
         clearTimeout(id) { timers.delete(id); },
         pycmd(message, acknowledge) {
+            if (message.startsWith('inline-typst-vim:')) {
+                vimRequests.push(JSON.parse(message.slice('inline-typst-vim:'.length)));
+                return;
+            }
             const request = JSON.parse(message.slice('inline-typst:'.length));
             requests.push(request);
             acknowledgements.set(request.id, acknowledge);
@@ -46,14 +54,17 @@ function fixture(html) {
     // Browsers upgrade elements in existing shadow trees when define() runs; linkedom needs this explicitly.
     for (const host of field.querySelectorAll('anki-typst')) window.customElements.upgrade(host);
     return {
-        window, document, field, requests,
+        window, document, field, requests, vimRequests,
         get guarded() { return guarded; },
         acknowledge(request, filename) { acknowledgements.get(request.id)({ filename }); },
-        async flush() {
+        async flush(maxDelay = 1000) {
             await new Promise(setImmediate);
-            const callbacks = [...timers.values()];
-            timers.clear();
-            for (const callback of callbacks) callback();
+            for (const [id, timer] of [...timers]) {
+                if (timer.delay <= maxDelay) {
+                    timers.delete(id);
+                    timer.fn();
+                }
+            }
             await new Promise(setImmediate);
         },
         respond(request, extra = {}) {
@@ -132,17 +143,18 @@ test('compiler errors stay inline and preserve source and the last good image', 
     assert.equal(host.querySelector('img').getAttribute('alt'), '[typst]$x$[/typst]');
 });
 
-test('version 1 images become clickable formulas without recompiling', async () => {
+test('version 1 images become clickable formulas and refresh with a transparent background', async () => {
     const f = fixture('Before <img src="typst-old.png" alt="[typst]$x$[/typst]"> after');
     const host = f.field.querySelector('anki-typst');
     assert.equal(host.getAttribute('data-source'), '$x$');
     assert.equal(host.querySelector('img').getAttribute('src'), 'typst-old.png');
     await f.flush();
-    assert.equal(f.requests.length, 0);
+    assert.equal(f.requests.length, 1);
+    assert.equal(f.requests[0].source, '$x$');
 });
 
 test('reopening saved fields preserves source and does not recompile', async () => {
-    const f = fixture('<anki-typst data-source="$x$" contenteditable="false">' +
+    const f = fixture('<anki-typst data-source="$x$" data-render="transparent-v1" contenteditable="false">' +
         '<img src="typst-saved.png" alt="[typst]$x$[/typst]"></anki-typst>');
     const host = f.field.querySelector('anki-typst');
     assert.equal(host.getAttribute('data-source'), '$x$');
@@ -208,4 +220,106 @@ test('a failed compilation restores the last good saved image after an acknowled
     f.respond(f.requests[1], { error: 'compilation failed' });
     assert.equal(host.querySelector('img').getAttribute('src'), 'typst-test.png');
     assert.equal(host.getAttribute('data-source'), '#bad()');
+});
+
+function key(input, window, name, extra = {}) {
+    const event = new window.Event('keydown', { bubbles: true, cancelable: true });
+    Object.assign(event, { key: name, ctrlKey: false, altKey: false, metaKey: false, shiftKey: false, ...extra });
+    input.dispatchEvent(event);
+    return event;
+}
+
+function beforeInput(input, window, inputType, data) {
+    const event = new window.Event('beforeinput', { bubbles: true, cancelable: true });
+    Object.assign(event, { inputType, data });
+    input.dispatchEvent(event);
+    return event;
+}
+
+test('transparent formulas include theme rules for both the popup preview and saved cards', async () => {
+    const f = fixture('[typst]$x$[/typst]');
+    await f.flush();
+    f.respond(f.requests[0]);
+    const host = f.field.querySelector('anki-typst');
+    assert.match(host.shadowRoot.querySelector('style').textContent, /background:transparent/);
+    assert.match(host.shadowRoot.querySelector('style').textContent, /host-context\(\.nightMode\)/);
+    assert.match(host.querySelector('style[data-typst-theme]').textContent, /filter:invert\(1\)/);
+    assert.equal(host.getAttribute('data-render'), 'transparent-v1');
+    assert.ok(host.querySelector('img').classList.contains('typst-transparent'));
+});
+
+test('typing a dollar pairs it, skips its closing partner, and backspaces the empty pair', async () => {
+    const f = fixture('[typst][/typst]');
+    await f.flush();
+    f.field.querySelector('anki-typst').open();
+    const input = f.document.querySelector('textarea');
+    beforeInput(input, f.window, 'insertText', '$');
+    assert.equal(input.value, '$$');
+    assert.equal(input.selectionStart, 1);
+    beforeInput(input, f.window, 'insertText', '$');
+    assert.equal(input.value, '$$');
+    assert.equal(input.selectionStart, 2);
+    input.setSelectionRange(1, 1);
+    beforeInput(input, f.window, 'deleteContentBackward', null);
+    assert.equal(input.value, '');
+});
+
+test('dollar pairing wraps a selection and leaves escaped dollars alone', async () => {
+    const f = fixture('[typst]alpha[/typst]');
+    await f.flush();
+    f.field.querySelector('anki-typst').open();
+    const input = f.document.querySelector('textarea');
+    input.setSelectionRange(0, 5);
+    beforeInput(input, f.window, 'insertText', '$');
+    assert.equal(input.value, '$alpha$');
+    input.value = '\\';
+    input.setSelectionRange(1, 1);
+    assert.equal(beforeInput(input, f.window, 'insertText', '$').defaultPrevented, false);
+});
+
+test('Vim starts at the source cursor and Escape goes to Neovim rather than closing the popup', async () => {
+    const f = fixture('[typst]$x$[/typst]', { vimEnabled: true });
+    await f.flush();
+    f.field.querySelector('anki-typst').open();
+    const start = f.vimRequests[0];
+    assert.equal(start.action, 'start');
+    assert.deepEqual(start.cursor, [1, 2]);
+    f.window.inlineTypst.vimReceive(start.session, { id: 1, source: '$x$', offset: 2, anchor: 2, mode: 'i', command: '' });
+    const input = f.document.querySelector('textarea');
+    const event = key(input, f.window, 'Escape');
+    assert.equal(event.defaultPrevented, true);
+    assert.equal(f.vimRequests[1].keys, '<Esc>');
+    assert.ok(f.document.querySelector('textarea'));
+    f.window.inlineTypst.vimReceive(start.session, { id: 2, source: '$x$', offset: 1, anchor: 1, mode: 'n', command: '' });
+    assert.match(f.document.querySelector('#inline-typst-editor').textContent, /NORMAL/);
+});
+
+test('Vim forwards the second mapping key before the first key has a response', async () => {
+    const f = fixture('[typst]$x$[/typst]', { vimEnabled: true });
+    await f.flush();
+    f.field.querySelector('anki-typst').open();
+    const session = f.vimRequests[0].session;
+    f.window.inlineTypst.vimReceive(session, { id: 1, source: '$x$', offset: 2, anchor: 2, mode: 'i', command: '' });
+    const input = f.document.querySelector('textarea');
+    key(input, f.window, 'j');
+    key(input, f.window, 'k');
+    assert.deepEqual(f.vimRequests.slice(1).map((request) => request.keys), ['j', 'k']);
+    f.window.inlineTypst.vimReceive(session, { id: 2, source: '$x$', offset: 1, anchor: 1, mode: 'n', command: '' });
+    f.window.inlineTypst.vimReceive(session, { id: 3, source: '$x$', offset: 1, anchor: 1, mode: 'n', command: '' });
+    assert.equal(input.value, '$x$');
+    assert.match(f.document.querySelector('#inline-typst-editor').textContent, /NORMAL/);
+});
+
+test('a missing Vim engine keeps the plain source editor usable', async () => {
+    const f = fixture('[typst]$x$[/typst]', { vimEnabled: true });
+    await f.flush();
+    f.field.querySelector('anki-typst').open();
+    const session = f.vimRequests[0].session;
+    f.window.inlineTypst.vimReceive(session, { error: 'Neovim was not found' });
+    const input = f.document.querySelector('textarea');
+    assert.match(f.document.querySelector('[role="status"]').textContent, /Neovim was not found/);
+    input.value = '$y$';
+    input.dispatchEvent(new f.window.Event('input'));
+    assert.equal(f.field.querySelector('anki-typst').getAttribute('data-source'), '$y$');
+    assert.equal(f.vimRequests[1].action, 'stop');
 });

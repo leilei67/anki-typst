@@ -1,3 +1,6 @@
 {
-  "compiler_path": ""
+  "compiler_path": "",
+  "vim_enabled": true,
+  "nvim_path": "",
+  "vimrc_path": ""
 }
